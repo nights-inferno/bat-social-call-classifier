@@ -15,14 +15,26 @@ from sklearn.metrics import (
     auc,
     log_loss,
     brier_score_loss,
+    balanced_accuracy_score,
     hamming_loss,
     accuracy_score,
     f1_score,
 )
+from sklearn.calibration import calibration_curve
 import warnings
 warnings.filterwarnings('ignore')
 
-def compute__metrics(y_true, y_pred_proba, 
+def summarize(values):
+    values = np.asarray(values, dtype=float)
+
+    return {
+        "mean": np.mean(values),
+        "std": np.std(values, ddof=1),
+        "min": np.min(values),
+        "max": np.max(values),
+    }
+
+def compute_metrics(y_true, y_pred_proba, 
                     label_names=None, threshold=0.5):
     """Compute comprehensive multi-label metrics for a single evaluation."""
     y_pred_binary = (y_pred_proba > threshold).astype(int)
@@ -34,11 +46,13 @@ def compute__metrics(y_true, y_pred_proba,
     metrics = {
         'Macro-AUC': roc_auc_score(y_true, y_pred_proba, average='macro'),
         'cmAP': average_precision_score(y_true, y_pred_proba, average='macro'),
+        'Macro-Balanced Accuracy' : np.mean([balanced_accuracy_score(y_true[:, i], y_pred_binary[:, i]) for i in range(n_labels)]),
         'AP per label': {},
         'Brier per label': {},
         'Log-Loss per label': {}
     }
     
+    #Per-label metrics
     for i, label_name in enumerate(label_names):
         # Average Precision (Recommended over trapezoidal PR-AUC)
         ap = average_precision_score(y_true[:, i], y_pred_proba[:, i])
@@ -54,20 +68,46 @@ def compute__metrics(y_true, y_pred_proba,
     
     return metrics
 
-def compute_cv_stats(y_true : list, y_pred_proba, label_names=None, threshold=0.5):
-    """Compute metrics across cross-validation folds."""
-    
-    # Compute metrics for each fold
+def compute_fold_metrics(y_true, y_pred_proba, label_names=None, threshold=0.5):
     fold_metrics = []
     for fold in range(len(y_true)):
-        fold_metrics.append(compute__metrics(
+        fold_metrics.append(compute_metrics(
             y_true[fold], 
             y_pred_proba[fold], 
             label_names, 
             threshold
         ))
-    
-    # Aggregate metrics across folds : mean,max,min
+    return fold_metrics
+
+
+def compute_cv_stats(fold_metrics):
+    """Compute metrics across cross-validation folds."""
+    result = {}
+    metrics = fold_metrics[0].keys()
+    for metric in metrics:
+
+        first_value = fold_metrics[0][metric]
+
+        # scalar metric
+        if np.isscalar(first_value):
+
+            vals = [m[metric] for m in fold_metrics]
+            result[metric] = summarize(vals)
+
+        # nested dict metric
+        elif isinstance(first_value, dict):
+
+            result[metric] = {}
+
+            labels = first_value.keys()
+
+            for label in labels:
+                vals = [m[metric][label] for m in fold_metrics]
+                result[metric][label] = summarize(vals)
+
+        else:
+            raise TypeError(f"Unsupported metric type for key={metric}")
+    """
     aggregated_metrics = {
         'Macro-AUC': [
             np.mean([m['Macro-AUC'] for m in fold_metrics]),
@@ -107,8 +147,26 @@ def compute_cv_stats(y_true : list, y_pred_proba, label_names=None, threshold=0.
             np.min([m['Log-Loss (macro)'] for m in fold_metrics])
         ]
     }
-    
-    return aggregated_metrics
+    """
+    return result
+
+def result_summary(y_true, y_pred_proba, label_names=None, threshold=0.5) :
+    oof_true = np.concatenate(y_true, axis=0)
+    oof_pred_proba = np.concatenate(y_pred_proba, axis=0)
+    fold_metrics = compute_fold_metrics(y_true, y_pred_proba, label_names, threshold)
+
+    results = {
+        "oof" :{
+            "metrics" : compute_metrics(oof_true, oof_pred_proba, label_names, threshold),
+            "true": oof_true,
+            "pred_proba": oof_pred_proba
+        },
+        "cv" : {
+            "stats" : compute_cv_stats(fold_metrics),
+            "folds": fold_metrics
+        }
+    }
+    return results
 
 
 def generate_metrics_table(all_results,label_names=None):
@@ -412,6 +470,78 @@ plot_model_comparison(
     title="Pipistrelle Classification: Encoder Comparison"
 )
 """
+
+def plot_calibration_curves(y_true,y_pred_proba,label_names=None,n_bins=10,strategy="quantile"):
+    """
+    Plot calibration curves + probability histograms
+    for multilabel classification.
+
+    Parameters
+    ----------
+    y_true : ndarray of shape (n_samples, n_labels)
+        Binary ground-truth matrix.
+
+    y_pred_proba : ndarray of shape (n_samples, n_labels)
+        Predicted probabilities.
+
+    label_names : list[str], optional
+        Names of labels.
+
+    n_bins : int
+        Number of calibration bins.
+
+    strategy : {"uniform", "quantile"}
+        Binning strategy for calibration_curve.
+    """
+    n_labels = y_true.shape[1]
+
+    if label_names is None:
+        label_names = [f"Label {i}" for i in range(n_labels)]
+
+    # 2 rows: top calibration curves, bottom histograms
+    fig, axes = plt.subplots(2,n_labels,figsize=(5 * n_labels, 8))
+
+    # handle case n_labels == 1
+    if n_labels == 1:
+        axes = np.array([[axes[0]], [axes[1]]])
+
+    for i in range(n_labels):
+        # Skip degenerate labels
+        if len(np.unique(y_true[:, i])) < 2:
+            axes[0, i].set_visible(False)
+            axes[1, i].set_visible(False)
+            continue
+        
+        brier = brier_score_loss(y_true[:, i],y_pred_proba[:, i])
+        # ---Calibration curve---------------
+        prob_true, prob_pred = calibration_curve(y_true[:, i],y_pred_proba[:, i],n_bins=n_bins,strategy=strategy)
+
+        ax_curve = axes[0, i]
+        ax_curve.plot(prob_pred,prob_true,marker='o',linewidth=2)
+        # perfect calibration
+        ax_curve.plot([0, 1],[0, 1],linestyle='--',color='gray')
+
+        ax_curve.set_title(f"{label_names[i]}\nBrier={brier:.3f}")
+        ax_curve.set_xlabel("Mean predicted probability")
+        ax_curve.set_ylabel("Fraction of positives")
+        ax_curve.set_xlim(0, 1)
+        ax_curve.set_ylim(0, 1)
+        ax_curve.grid(True)
+
+        # ---Histogram-----------------------
+        ax_hist = axes[1, i]
+        ax_hist.hist(y_pred_proba[:, i],bins=n_bins,alpha=0.7)
+
+        ax_hist.set_title(f"{label_names[i]} Probability Distribution")
+        ax_hist.set_xlabel("Predicted probability")
+        ax_hist.set_ylabel("Count")
+        ax_hist.set_xlim(0, 1)
+        ax_hist.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
 
 
 def label_confusion(y_true,y_pred_proba,y_pred_binary=None, label_names=None, threshold=0.5) :

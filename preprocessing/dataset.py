@@ -23,7 +23,8 @@ class BatAudioPipeline(torch.nn.Module):
         target_sr=16000, 
         expansion_factor=10, 
         window_sec=10, 
-        overlap=0.5
+        overlap=0.5,
+        filter_echo : bool = False,
     ) -> None :
         
         super().__init__()
@@ -33,7 +34,7 @@ class BatAudioPipeline(torch.nn.Module):
         # Windowing parameters
         self.win_samples = window_sec * target_sr
         self.hop_samples = int(self.win_samples * (1.0 - overlap))
-        
+        self.filter_echo = filter_echo
 
     def load_and_expand(self, file_path : str) -> torch.Tensor:
         """Loads audio using soundfile and applies 10x time expansion logic."""
@@ -71,7 +72,14 @@ class BatAudioPipeline(torch.nn.Module):
         """
         Filters frequencies bats don't emit, taking into account time expansion.
         The high-cut is already handled by the resampling Nyquist limit.
+        Eventually cuts out echolocation frequency band
         """
+        if self.filter_echo:
+            fmin = 40000/self.expansion_factor
+            fmax = 75000/self.expansion_factor
+            fcenter = np.sqrt(fmin * fmax)
+            Q = fcenter / (fmax - fmin)
+            audio = AF.bandreject_biquad(audio, sample_rate=self.target_sr, central_freq=fcenter, Q=Q)
         # Highpass biquad filter at 15/time_expansion_factor kHz (Expanded domain)
         return AF.highpass_biquad(audio, sample_rate=self.target_sr, cutoff_freq=15000/self.expansion_factor)
 
@@ -269,7 +277,9 @@ class PipistrelleDataset(Dataset):
         is_training : bool =False,
         resample : bool = False, 
         resample_augment=None,
-        online_augment = None, 
+        online_augment = None,
+        filter_echo : bool = False,
+        overlap : float = 0.5,
         encoder : str ="perch2"
     ) -> None :
         
@@ -282,14 +292,15 @@ class PipistrelleDataset(Dataset):
         self.resample_augment = resample_augment or [False]
         #First element indicates if online augmentation should happen, other elements are the augmentations to apply during online augmentation
         self.online_augment = online_augment or [False]
+        self.filter_echo = filter_echo
 
         self.augmentation_pipeline = AugmentationPipeline(online_augment, resample_augment)
 
          # Initialize processing pipeline
         if encoder == "perch2":
-            self.pipeline = BatAudioPipeline(target_sr=32000, expansion_factor=5,window_sec =5)
+            self.pipeline = BatAudioPipeline(target_sr=32000, expansion_factor=5,window_sec =5,overlap=overlap, filter_echo=filter_echo)
         elif encoder == "effnetb0" or encoder == "NLM_BEATs":
-            self.pipeline = BatAudioPipeline(target_sr=16000, expansion_factor=10,window_sec =10)
+            self.pipeline = BatAudioPipeline(target_sr=16000, expansion_factor=10,window_sec =10,overlap=overlap, filter_echo=filter_echo)
         else:
             raise ValueError("Unsupported encoder")
 
