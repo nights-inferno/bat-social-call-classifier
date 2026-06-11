@@ -24,16 +24,31 @@ from sklearn.calibration import calibration_curve
 import warnings
 warnings.filterwarnings('ignore')
 
-def calculate_ece(y_true, y_prob, n_bins=5):
-    bins = np.linspace(0, 1, n_bins + 1)
-    ece = 0
-    for bin_lower, bin_upper in zip(bins[:-1], bins[1:]):
-        mask = (y_prob >= bin_lower) & (y_prob < bin_upper)
-        if np.sum(mask) > 0:
-            bin_conf = np.mean(y_prob[mask])
-            bin_acc = np.mean(y_true[mask])
-            ece += np.abs(bin_conf - bin_acc) * np.sum(mask)
-    return ece / len(y_true)
+def calculate_ece(y_true, y_prob, n_bins=10, strategy='uniform'):
+    """Calculates the Expected Calibration Error (ECE) for binary targets."""
+    if strategy == 'uniform':
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+    elif strategy == 'quantile':
+        bin_edges = np.percentile(y_prob, np.linspace(0, 100, n_bins + 1))
+        bin_edges = np.unique(bin_edges) # Handle overlapping quantiles
+        if len(bin_edges) < 2:
+            return 0.0
+    
+    ece = 0.0
+    n_samples = len(y_true)
+    
+    for i in range(len(bin_edges) - 1):
+        bin_idx = (y_prob >= bin_edges[i]) & (y_prob < bin_edges[i+1])
+        if i == len(bin_edges) - 2: # Include right edge for the last bin
+            bin_idx = bin_idx | (y_prob == bin_edges[i+1])
+            
+        bin_size = np.sum(bin_idx)
+        if bin_size > 0:
+            bin_acc = np.mean(y_true[bin_idx])
+            bin_conf = np.mean(y_prob[bin_idx])
+            ece += (bin_size / n_samples) * np.abs(bin_acc - bin_conf)
+            
+    return ece
 
 def summarize(values):
     values = np.asarray(values, dtype=float)
@@ -164,6 +179,29 @@ def compile_results(all_results,label_names=None,stats : bool = True,encoder : s
             y_true.append(trial_data['oof_y_true'])
             y_pred_proba.append(trial_data['oof_y_pred_proba'])
         # 2. Compute summary metrics for this model
+        model_results = result_summary(y_true, y_pred_proba, label_names, stats=stats)
+        compiled_results[encoder + " " + model_name] = model_results
+
+    return compiled_results
+
+def compile_results_folds(all_results,label_names=None,stats : bool = True,encoder : str = 'perch2') :
+    if label_names is None:
+        label_names = ['Type A', 'Type B', 'Type C', 'Type D', 'Echo']
+    
+    compiled_results = {}
+    unique_models = list(set([r['model'] for r in all_results]))
+    for model_name in unique_models:
+        # 1. Gather all trials for this specific classifier
+        model_trials = [r for r in all_results if r['model'] == model_name]
+        y_true = []
+        y_pred_proba = []
+        for trial_data in model_trials:
+            # These are already concatenated across the outer folds!
+            y_true.append(trial_data['y_true_cv'])
+            y_pred_proba.append(trial_data['y_pred_proba_cv'])
+        # 2. Compute summary metrics for this model
+        y_true = np.concatenate(y_true,axis = 0)
+        y_pred_proba = np.concatenate(y_pred_proba,axis=0)
         model_results = result_summary(y_true, y_pred_proba, label_names, stats=stats)
         compiled_results[encoder + " " + model_name] = model_results
 
@@ -594,7 +632,614 @@ def plot_comprehensive_results3(all_results, labels, title="Model Evaluation"):
     plt.tight_layout(rect=[0, 0.02, 1, 0.98])
     plt.show()
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import average_precision_score
 
+def plot_comprehensive_boxplots(all_encoders_results, label_names=None):
+    """
+    Plots a 2x3 grid of subplots for a research paper report layout:
+    Row 1: Type A, Type B, Type C
+    Row 2: Type D, Echo, cmAP
+    
+    Features:
+    - Global title and figure title removed (handled by external paper caption text).
+    - Multi-line labels centered cleanly under the columns to completely avoid clipping.
+    - Global legend placed safely underneath the grid.
+    """
+    if label_names is None:
+        label_names = ['Type A', 'Type B', 'Type C', 'Type D', 'Echo']
+        
+    # --- Step 1: Parse Raw Fold Arrays into a Structured DataFrame ---
+    rows = []
+    baseline_stats = {} 
+    
+    for encoder_name, trials_list in all_encoders_results.items():
+        baseline_stats[encoder_name] = {'cmAP': [], 'classes': {l: [] for l in label_names}}
+        
+        for trial in trials_list:
+            model_name = trial['model']
+            y_true_folds = trial['y_true_cv']          
+            y_pred_proba_folds = trial['y_pred_proba_cv']  
+            
+            for fold_idx in range(len(y_true_folds)):
+                y_true = y_true_folds[fold_idx]
+                y_pred_proba = y_pred_proba_folds[fold_idx]
+                
+                fold_cmap = average_precision_score(y_true, y_pred_proba, average='macro')
+                
+                fold_class_aps = {}
+                for idx, name in enumerate(label_names):
+                    fold_class_aps[name] = average_precision_score(y_true[:, idx], y_pred_proba[:, idx])
+                
+                if any(x in model_name.lower() for x in ['prevalence', 'dummy', 'guesser']):
+                    baseline_stats[encoder_name]['cmAP'].append(fold_cmap)
+                    for name in label_names:
+                        baseline_stats[encoder_name]['classes'][name].append(fold_class_aps[name])
+                else:
+                    clean_model_name = model_name
+                    if any(x in model_name.lower() for x in ['logistic', 'regressor', 'regression']):
+                        clean_model_name = 'lr'
+                    elif 'svm' in model_name.lower():
+                        clean_model_name = 'svm'
+                    elif any(x in model_name.lower() for x in ['forest', 'rf']):
+                        clean_model_name = 'rf'
+                    elif 'mlp' in model_name.lower():
+                        clean_model_name = 'mlp'
+                        
+                    row = {
+                        'Encoder': encoder_name,
+                        'Model': clean_model_name,
+                        'cmAP': fold_cmap
+                    }
+                    for name in label_names:
+                        row[f'AP_{name}'] = fold_class_aps[name]
+                    rows.append(row)
+                    
+    df = pd.DataFrame(rows)
+    
+    model_order = ['lr', 'svm', 'rf', 'mlp']
+    df = df[df['Model'].isin(model_order)]
+    
+    # --- Step 2: Establish Layout Structure (2 Rows x 3 Columns) ---
+    sns.set_context("paper", font_scale=1.1)
+    sns.set_style("whitegrid", {"grid.linestyle": "--", "grid.alpha": 0.5})
+    
+    pastel_palette = sns.color_palette("Pastel1", n_colors=3)
+    encoders_list = list(all_encoders_results.keys())
+    encoder_colors = {encoders_list[i]: pastel_palette[i] for i in range(len(encoders_list))}
+    
+    row1_targets = [(f'AP_{label_names[0]}', label_names[0]), 
+                    (f'AP_{label_names[1]}', label_names[1]), 
+                    (f'AP_{label_names[2]}', label_names[2])]
+    
+    row2_targets = [(f'AP_{label_names[3]}', label_names[3]), 
+                    (f'AP_{label_names[4]}', label_names[4]), 
+                    ('cmAP', r'$cmAP$')]
+    
+    grid_targets = [row1_targets, row2_targets]
+    
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+
+    # --- Step 3: Run Visualization Iteration Loop ---
+    for r_idx in range(2):
+        for c_idx in range(3):
+            ax = axes[r_idx, c_idx]
+            col_name, display_title = grid_targets[r_idx][c_idx]
+            
+            # Plot distributions showing outliers only
+            sns.boxplot(
+                data=df, x='Model', y=col_name, hue='Encoder',
+                order=model_order, palette=encoder_colors,
+                ax=ax, width=0.6, showfliers=True, 
+                flierprops=dict(marker='o', markerfacecolor='gray', markersize=4, markeredgecolor='none', alpha=0.6),
+                boxprops=dict(edgecolor='#4d4d4d', linewidth=1.2),
+                whiskerprops=dict(color='#4d4d4d', linewidth=1.1),
+                capprops=dict(color='#4d4d4d', linewidth=1.1),
+                medianprops=dict(color='#2c3e50', linewidth=1.5)
+            )
+            
+            # --- Step 4: Compute a Single Unified Chance Level ---
+            chance_title_suffix = ""
+            if encoders_list:
+                first_encoder = encoders_list[0]
+                
+                if col_name == 'cmAP':
+                    baseline_vals = baseline_stats[first_encoder]['cmAP']
+                else:
+                    class_name = col_name.replace('AP_', '')
+                    baseline_vals = baseline_stats[first_encoder]['classes'][class_name]
+                    
+                if len(baseline_vals) > 0:
+                    mean_baseline = np.mean(baseline_vals)
+                    chance_title_suffix = f" | Chance level = {mean_baseline:.2f}"
+            
+            # --- Step 5: Refine Independent Scales & Clean multi-line Labels ---
+            ax.set_title(display_title, fontsize=18, fontweight='bold', pad=18)
+            ax.text(0.5, 1.03, chance_title_suffix, transform=ax.transAxes, 
+                    fontsize=12, color='#666666', style='italic', ha='center')
+            
+            ax.set_xlabel("", fontsize=13)
+            ax.set_ylabel("Average Precision (AP)" if c_idx == 0 else "", fontsize=14)
+            
+            # Formats names onto 2 lines, kept completely flat (rotation=0) and centered
+            display_labels = ["Logistic\nRegressor", "SVM", "Random\nForest", "MLP"]
+            ax.set_xticklabels(display_labels, rotation=0, ha='center', fontsize=13)
+            ax.tick_params(axis='y', labelsize=14)
+            
+            # Auto-scale limits nicely based on data variance limits
+            current_data = df[col_name].dropna()
+            if not current_data.empty:
+                ymin, ymax = current_data.min(), current_data.max()
+                yrange = ymax - ymin if ymax != ymin else 0.1
+                ax.set_ylim(max(0, ymin - 0.05 * yrange), min(1.02, ymax + 0.05 * yrange))
+                
+            ax.get_legend().remove()
+                
+    # --- Step 6: Generate a Unified Global External Legend Below Layout ---
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles, labels, 
+        title="Audio Feature Encoders", 
+        loc='lower center', 
+        ncol=3, 
+        fontsize=13, 
+        title_fontsize=11,
+        frameon=True, 
+        facecolor='white', 
+        edgecolor='#e0e0e0',
+        bbox_to_anchor=(0.5, 0.00)
+    )
+    
+    # Balanced layout adjustments to give breathing room for the bottom legend and multi-line labels
+    plt.tight_layout(rect=[0, 0.12, 1, 0.95])
+    plt.subplots_adjust(hspace=0.4, wspace=0.22)
+    plt.show()
+
+def plot_comprehensive_boxplots_no_echo(all_encoders_results, label_names=None):
+    """
+    Plots a 2x3 grid (now only 5 active subplots) excluding Echolocation.
+    """
+    # 1. Ensure Echo is removed from the processed labels
+    if label_names is None:
+        label_names = ['Type A', 'Type B', 'Type C', 'Type D']
+    else:
+        label_names = [l for l in label_names if 'echo' not in l.lower()]
+        
+    # --- Step 1: Parse Raw Fold Arrays ---
+    rows = []
+    baseline_stats = {} 
+    
+    for encoder_name, trials_list in all_encoders_results.items():
+        baseline_stats[encoder_name] = {'cmAP': [], 'classes': {l: [] for l in label_names}}
+        
+        for trial in trials_list:
+            model_name = trial['model']
+            y_true_folds = trial['y_true_cv']          
+            y_pred_proba_folds = trial['y_pred_proba_cv']  
+            
+            for fold_idx in range(len(y_true_folds)):
+                y_true = y_true_folds[fold_idx]
+                y_pred_proba = y_pred_proba_folds[fold_idx]
+                
+                fold_cmap = average_precision_score(y_true, y_pred_proba, average='macro')
+                
+                fold_class_aps = {}
+                for idx, name in enumerate(label_names):
+                    # Indexing assumes y_true/y_pred_proba still have the same columns
+                    # If 'Echo' was index 4, it is ignored here because label_names doesn't contain it
+                    fold_class_aps[name] = average_precision_score(y_true[:, idx], y_pred_proba[:, idx])
+                
+                if any(x in model_name.lower() for x in ['prevalence', 'dummy', 'guesser']):
+                    baseline_stats[encoder_name]['cmAP'].append(fold_cmap)
+                    for name in label_names:
+                        baseline_stats[encoder_name]['classes'][name].append(fold_class_aps[name])
+                else:
+                    clean_model_name = model_name
+                    if any(x in model_name.lower() for x in ['logistic', 'regressor', 'regression']):
+                        clean_model_name = 'lr'
+                    elif 'svm' in model_name.lower():
+                        clean_model_name = 'svm'
+                    elif any(x in model_name.lower() for x in ['forest', 'rf']):
+                        clean_model_name = 'rf'
+                    elif 'mlp' in model_name.lower():
+                        clean_model_name = 'mlp'
+                        
+                    row = {'Encoder': encoder_name, 'Model': clean_model_name, 'cmAP': fold_cmap}
+                    for name in label_names:
+                        row[f'AP_{name}'] = fold_class_aps[name]
+                    rows.append(row)
+                    
+    df = pd.DataFrame(rows)
+    model_order = ['lr', 'svm', 'rf', 'mlp']
+    df = df[df['Model'].isin(model_order)]
+    
+    # --- Step 2: Grid Setup ---
+    sns.set_context("paper", font_scale=1.1)
+    sns.set_style("whitegrid", {"grid.linestyle": "--", "grid.alpha": 0.5})
+    
+    pastel_palette = sns.color_palette("Pastel1", n_colors=len(all_encoders_results))
+    encoders_list = list(all_encoders_results.keys())
+    encoder_colors = {encoders_list[i]: pastel_palette[i] for i in range(len(encoders_list))}
+    
+    # Organize 5 targets into a 2x3 grid (last cell will be empty)
+    targets = [(f'AP_{l}', l) for l in label_names] + [('cmAP', r'$cmAP$')]
+    
+    fig, axes = plt.subplots(2, 3, figsize=(16, 12))
+    axes_flat = axes.flatten()
+
+    # --- Step 3: Visualization Loop ---
+    for i, ax in enumerate(axes_flat):
+        if i < len(targets):
+            col_name, display_title = targets[i]
+            
+            sns.boxplot(data=df, x='Model', y=col_name, hue='Encoder',
+                        order=model_order, palette=encoder_colors, ax=ax, width=0.6,
+                        showfliers=True, flierprops=dict(marker='o', markersize=4, alpha=0.6),
+                        boxprops=dict(edgecolor='#4d4d4d', linewidth=1.2))
+            
+            # Chance logic
+            if encoders_list:
+                first_enc = encoders_list[0]
+                vals = baseline_stats[first_enc]['cmAP'] if col_name == 'cmAP' else \
+                       baseline_stats[first_enc]['classes'][col_name.replace('AP_', '')]
+                if vals: ax.text(0.5, 1.03, f"Chance: {np.mean(vals):.2f}", transform=ax.transAxes, ha='center', color='#666666')
+
+                    # Increase font sizes across the board
+            ax.set_title(display_title, fontsize=20, fontweight='bold', pad=25) # Increased pad
+
+            
+            ax.set_xlabel("", fontsize=16)
+            ax.set_ylabel("Average Precision (AP)" if i % 3 == 0 else "", fontsize=18)
+
+            # Larger tick labels
+            ax.set_xticklabels(["Logistic\nReg", "SVM", "Random\nForest", "MLP"], fontsize=14)
+            ax.tick_params(axis='y', labelsize=14)
+            ax.get_legend().remove()
+        else:
+            ax.axis('off') # Hide the 6th empty plot
+
+    # --- Step 4: Legend & Layout ---
+    handles, labels = axes_flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, title="Encoders", loc='lower center', 
+               ncol=len(encoders_list), bbox_to_anchor=(0.5, 0.02),
+               fontsize=16, title_fontsize=18) # Larger legend
+    
+    # Adjust layout to accommodate larger text
+    plt.tight_layout(rect=[0, 0.12, 1, 0.95])
+    plt.show()
+
+def plot_mlp_balancing_boxplots(mlp_results, label_names=None):
+    """
+    Plots a 2x3 grid of subplots for a research paper report layout:
+    Row 1: Type A, Type B, Type C
+    Row 2: Type D, Echo, cmAP
+    
+    This matches the publication aesthetic of your encoder choice plot, 
+    adapted for evaluating different class-balancing variants of the MLP.
+    """
+    if label_names is None:
+        label_names = ['Type A', 'Type B', 'Type C', 'Type D', 'Echo']
+        
+    # --- Step 1: Parse Raw Fold Arrays into a Structured DataFrame ---
+    rows = []
+    
+    # Extract entries directly out of your balancing_mlp_val output list
+    for trial_entry in mlp_results:
+        model_name = trial_entry['model']      # e.g., 'MLP_FocalLoss'
+        y_true_folds = trial_entry['y_true_cv']          
+        y_pred_proba_folds = trial_entry['y_pred_proba_cv']  
+        
+        # Clean up strings for display on the X-axis
+        clean_model_name = model_name.replace('MLP_', '')
+        if clean_model_name == 'ClassWeights':
+            clean_model_name = 'Class Weights'
+        elif clean_model_name == 'FocalLoss':
+            clean_model_name = 'Focal Loss'
+            
+        for fold_idx in range(len(y_true_folds)):
+            y_true = y_true_folds[fold_idx]
+            y_pred_proba = y_pred_proba_folds[fold_idx]
+            
+            # Compute macro-averaged metric across this active validation partition
+            fold_cmap = average_precision_score(y_true, y_pred_proba, average='macro')
+            
+            # Extract individual acoustic call-type dimensions
+            row = {
+                'Strategy': clean_model_name,
+                'cmAP': fold_cmap
+            }
+            for idx, name in enumerate(label_names):
+                row[f'AP_{name}'] = average_precision_score(y_true[:, idx], y_pred_proba[:, idx])
+                
+            rows.append(row)
+                    
+    df = pd.DataFrame(rows)
+    
+    strategy_order = ['Baseline', 'Class Weights', 'Focal Loss', 'Oversampled']
+    df = df[df['Strategy'].isin(strategy_order)]
+    
+    # --- Step 2: Establish Layout Structure (2 Rows x 3 Columns) ---
+    sns.set_context("paper", font_scale=1.1)
+    sns.set_style("whitegrid", {"grid.linestyle": "--", "grid.alpha": 0.5})
+    
+    # Replicating the clean, high-contrast palette from your reference images
+    # 4 distinct colors matching your balancing configurations
+    custom_palette = ['#8BBCE6', '#9EE4A5', '#F8B5C5', '#FAD390']
+    strategy_colors = {strategy_order[i]: custom_palette[i] for i in range(len(strategy_order))}
+    
+    row1_targets = [(f'AP_{label_names[0]}', label_names[0]), 
+                    (f'AP_{label_names[1]}', label_names[1]), 
+                    (f'AP_{label_names[2]}', label_names[2])]
+    
+    row2_targets = [(f'AP_{label_names[3]}', label_names[3]), 
+                    (f'AP_{label_names[4]}', label_names[4]), 
+                    ('cmAP', r'$cmAP$')]
+    
+    grid_targets = [row1_targets, row2_targets]
+    
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), sharey=False)
+
+    # --- Step 3: Run Visualization Iteration Loop ---
+    for r_idx in range(2):
+        for c_idx in range(3):
+            ax = axes[r_idx, c_idx]
+            col_name, display_title = grid_targets[r_idx][c_idx]
+            
+            # Render clean, aligned boxplots
+            sns.boxplot(
+                data=df, x='Strategy', y=col_name, hue='Strategy',
+                order=strategy_order, palette=strategy_colors,
+                ax=ax, width=0.55, showfliers=True, legend=False,
+                flierprops=dict(marker='o', markerfacecolor='gray', markersize=4, markeredgecolor='none', alpha=0.6),
+                boxprops=dict(edgecolor='#4d4d4d', linewidth=1.2),
+                whiskerprops=dict(color='#4d4d4d', linewidth=1.1),
+                capprops=dict(color='#4d4d4d', linewidth=1.1),
+                medianprops=dict(color='#2c3e50', linewidth=1.5)
+            )
+            
+            # --- Step 4: Refine Aesthetics, Limits, and Label Padding ---
+            ax.set_title(display_title, fontsize=12, fontweight='bold', pad=12)
+            ax.set_xlabel("", fontsize=10)
+            ax.set_ylabel("Average Precision (AP)" if c_idx == 0 else "", fontsize=11)
+            
+            # Center and balance multi-line x-axis category markers 
+            display_labels = ["Baseline\n(BCE)", "Class\nWeights", "Focal\nLoss", "Iterative\nOversample"]
+            ax.set_xticklabels(display_labels, rotation=0, ha='center', fontsize=9.5)
+            
+            # Auto-scale limits based tightly on data variance thresholds
+            current_data = df[col_name].dropna()
+            if not current_data.empty:
+                ymin, ymax = current_data.min(), current_data.max()
+                yrange = ymax - ymin if ymax != ymin else 0.1
+                ax.set_ylim(max(0, ymin - 0.08 * yrange), min(1.02, ymax + 0.08 * yrange))
+                
+    # Balanced layout adjustments to give breathing room for text labels
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.42, wspace=0.22, bottom=0.1)
+    plt.show()
+
+def plot_comprehensive_mlp_boxplots(balancing_results, augmented_results, label_names=None):
+    """
+    Plots a 2x3 grid of subplots evaluating 5 MLP strategies for a research paper:
+    Row 1: Type A, Type B, Type C
+    Row 2: Type D, Echo, cmAP
+    
+    Accepts the balancing results list and the data-augmented results list separately.
+    """
+    if label_names is None:
+        label_names = ['Type A', 'Type B', 'Type C', 'Type D', 'Echo']
+        
+    rows = []
+    
+    # --- Step 1: Parse Standard Balancing Results ---
+    for trial_entry in balancing_results:
+        model_name = trial_entry['model']      
+        y_true_folds = trial_entry['y_true_cv']          
+        y_pred_proba_folds = trial_entry['y_pred_proba_cv']  
+        
+        clean_name = model_name.replace('MLP_', '')
+        if clean_name == 'ClassWeights':
+            clean_name = 'Class Weights'
+        elif clean_name == 'FocalLoss':
+            clean_name = 'Focal Loss'
+            
+        for fold_idx in range(len(y_true_folds)):
+            y_true = y_true_folds[fold_idx]
+            y_pred_proba = y_pred_proba_folds[fold_idx]
+            
+            fold_cmap = average_precision_score(y_true, y_pred_proba, average='macro')
+            row = {'Strategy': clean_name, 'cmAP': fold_cmap}
+            for idx, name in enumerate(label_names):
+                row[f'AP_{name}'] = average_precision_score(y_true[:, idx], y_pred_proba[:, idx])
+            rows.append(row)
+            
+    # --- Step 2: Parse Data Augmented Results ---
+    for trial_entry in augmented_results:
+        y_true_folds = trial_entry['y_true_cv']          
+        y_pred_proba_folds = trial_entry['y_pred_proba_cv']  
+        
+        for fold_idx in range(len(y_true_folds)):
+            y_true = y_true_folds[fold_idx]
+            y_pred_proba = y_pred_proba_folds[fold_idx]
+            
+            fold_cmap = average_precision_score(y_true, y_pred_proba, average='macro')
+            row = {'Strategy': 'Augmented', 'cmAP': fold_cmap}
+            for idx, name in enumerate(label_names):
+                row[f'AP_{name}'] = average_precision_score(y_true[:, idx], y_pred_proba[:, idx])
+            rows.append(row)
+                    
+    df = pd.DataFrame(rows)
+    
+    # Updated explicit order containing all 5 validation strategies
+    strategy_order = ['Baseline', 'Class Weights', 'Focal Loss', 'Oversampled', 'Augmented']
+    df = df[df['Strategy'].isin(strategy_order)]
+    
+    # --- Step 3: Establish Layout Structure (2 Rows x 3 Columns) ---
+    sns.set_context("paper", font_scale=1.1)
+    sns.set_style("whitegrid", {"grid.linestyle": "--", "grid.alpha": 0.5})
+    
+    # Added a matching complementary 5th color tone for Data Augmentation
+    custom_palette = ['#8BBCE6', '#9EE4A5', '#F8B5C5', '#FAD390', '#D1B3F1']
+    strategy_colors = {strategy_order[i]: custom_palette[i] for i in range(len(strategy_order))}
+    
+    row1_targets = [(f'AP_{label_names[0]}', label_names[0]), 
+                    (f'AP_{label_names[1]}', label_names[1]), 
+                    (f'AP_{label_names[2]}', label_names[2])]
+    
+    row2_targets = [(f'AP_{label_names[3]}', label_names[3]), 
+                    (f'AP_{label_names[4]}', label_names[4]), 
+                    ('cmAP', r'$cmAP$')]
+    
+    grid_targets = [row1_targets, row2_targets]
+    
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharey=False)
+
+    # --- Step 4: Run Visualization Iteration Loop ---
+    for r_idx in range(2):
+        for c_idx in range(3):
+            ax = axes[r_idx, c_idx]
+            col_name, display_title = grid_targets[r_idx][c_idx]
+            
+            sns.boxplot(
+                data=df, x='Strategy', y=col_name, hue='Strategy',
+                order=strategy_order, palette=strategy_colors,
+                ax=ax, width=0.6, showfliers=True, legend=False,
+                flierprops=dict(marker='o', markerfacecolor='gray', markersize=4, markeredgecolor='none', alpha=0.6),
+                boxprops=dict(edgecolor='#4d4d4d', linewidth=1.2),
+                whiskerprops=dict(color='#4d4d4d', linewidth=1.1),
+                capprops=dict(color='#4d4d4d', linewidth=1.1),
+                medianprops=dict(color='#2c3e50', linewidth=1.5)
+            )
+            
+            # --- Step 5: Refine Aesthetics, Limits, and Label Padding ---
+            ax.set_title(display_title, fontsize=12, fontweight='bold', pad=14)
+            ax.set_xlabel("", fontsize=10)
+            ax.set_ylabel("Average Precision (AP)" if c_idx == 0 else "", fontsize=12)
+            
+            # Formatting labels nicely onto two lines to maintain breathing room
+            display_labels = ["Baseline\n(BCE)", "Class\nWeights", "Focal\nLoss", "Oversample", "Data\nAugmented"]
+            ax.set_xticklabels(display_labels, rotation=0, ha='center', fontsize=13)
+            ax.tick_params(axis='y', labelsize=14)
+            
+            # Auto-scale axis limits tightly based on data distribution boundaries
+            current_data = df[col_name].dropna()
+            if not current_data.empty:
+                ymin, ymax = current_data.min(), current_data.max()
+                yrange = ymax - ymin if ymax != ymin else 0.1
+                ax.set_ylim(max(0, ymin - 0.08 * yrange), min(1.02, ymax + 0.08 * yrange))
+                
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.42, wspace=0.22, bottom=0.1)
+    plt.show()
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import average_precision_score
+
+def plot_abmil_vs_perch_boxplots(abmil_results, per2_results, label_names=None):
+    """
+    Plots a 2x3 grid of boxplots comparing Tuned ABMIL vs Perch 2.0 + Logistic Regression.
+    Row 1: Type A, Type B, Type C AP
+    Row 2: Type D, Echo, and overall cmAP
+    """
+    if label_names is None:
+        label_names = ['Type A', 'Type B', 'Type C', 'Type D', 'Echo']
+        
+    rows = []
+    
+    # --- Step 1: Parse ABMIL Results ---
+    for trial_entry in abmil_results:
+        y_true_folds = trial_entry['y_true_cv']          
+        y_pred_proba_folds = trial_entry['y_pred_proba_cv']  
+        
+        for fold_idx in range(len(y_true_folds)):
+            y_true = np.array(y_true_folds[fold_idx])
+            y_pred_proba = np.array(y_pred_proba_folds[fold_idx])
+            
+            fold_cmap = average_precision_score(y_true, y_pred_proba, average='macro')
+            row = {'Framework': 'ABMIL', 'cmAP': fold_cmap}
+            for idx, name in enumerate(label_names):
+                row[f'AP_{name}'] = average_precision_score(y_true[:, idx], y_pred_proba[:, idx])
+            rows.append(row)
+            
+    # --- Step 2: Parse Perch 2.0 Logistic Regression Results ---
+    # Extract only Logistic Regression entries from your Perch dictionary storage
+    perch_lr_entries = [entry for entry in per2_results if entry.get('model') == 'Logistic Regression']
+    
+    for trial_entry in perch_lr_entries:
+        y_true_folds = trial_entry['y_true_cv']          
+        y_pred_proba_folds = trial_entry['y_pred_proba_cv']  
+        
+        for fold_idx in range(len(y_true_folds)):
+            y_true = np.array(y_true_folds[fold_idx])
+            y_pred_proba = np.array(y_pred_proba_folds[fold_idx])
+            
+            fold_cmap = average_precision_score(y_true, y_pred_proba, average='macro')
+            row = {'Framework': 'Logistic Regression', 'cmAP': fold_cmap}
+            for idx, name in enumerate(label_names):
+                row[f'AP_{name}'] = average_precision_score(y_true[:, idx], y_pred_proba[:, idx])
+            rows.append(row)
+                    
+    df = pd.DataFrame(rows)
+    framework_order = ['Logistic Regression', 'ABMIL']
+    
+    # --- Step 3: Aesthetic Grid Setup ---
+    sns.set_context("paper", font_scale=1.1)
+    sns.set_style("whitegrid", {"grid.linestyle": "--", "grid.alpha": 0.5})
+    
+    # Professional, highly-distinguishable contrasting dual-palette
+    framework_colors = {'Logistic Regression': '#8BBCE6', 'ABMIL': '#FAD390'}
+    
+    row1_targets = [(f'AP_{label_names[0]}', label_names[0]), 
+                    (f'AP_{label_names[1]}', label_names[1]), 
+                    (f'AP_{label_names[2]}', label_names[2])]
+    
+    row2_targets = [(f'AP_{label_names[3]}', label_names[3]), 
+                    (f'AP_{label_names[4]}', label_names[4]), 
+                    ('cmAP', r'$cmAP$')]
+    
+    grid_targets = [row1_targets, row2_targets]
+    fig, axes = plt.subplots(2, 3, figsize=(14, 6), sharey=False)
+
+    # --- Step 4: Iteration Plot Loop ---
+    for r_idx in range(2):
+        for c_idx in range(3):
+            ax = axes[r_idx, c_idx]
+            col_name, display_title = grid_targets[r_idx][c_idx]
+            
+            sns.boxplot(
+                data=df, x='Framework', y=col_name, hue='Framework',
+                order=framework_order, palette=framework_colors,
+                ax=ax, width=0.4, showfliers=True, legend=False,
+                flierprops=dict(marker='o', markerfacecolor='gray', markersize=4, markeredgecolor='none', alpha=0.6),
+                boxprops=dict(edgecolor='#4d4d4d', linewidth=1.2),
+                whiskerprops=dict(color='#4d4d4d', linewidth=1.1),
+                capprops=dict(color='#4d4d4d', linewidth=1.1),
+                medianprops=dict(color='#2c3e50', linewidth=1.5)
+            )
+            
+            ax.set_title(display_title, fontsize=15, fontweight='bold', pad=12)
+            ax.set_xlabel("", fontsize=15)
+            ax.set_ylabel("Average Precision (AP)" if c_idx == 0 else "", fontsize=14)
+            
+            # Formatted labels on single lines since we only have two groups now
+            ax.set_xticklabels(framework_order, fontsize=14, fontweight='bold')
+            ax.tick_params(axis='y', labelsize=14)
+            # Dynamic boundaries fitting the specific distributions
+            current_data = df[col_name].dropna()
+            if not current_data.empty:
+                ymin, ymax = current_data.min(), current_data.max()
+                yrange = ymax - ymin if ymax != ymin else 0.1
+                ax.set_ylim(max(0, ymin - 0.1 * yrange), min(1.02, ymax + 0.1 * yrange))
+                
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.35, wspace=0.22, bottom=0.1)
+    plt.show()
 
 """Implementation
 # 1. Collect your stats into a dictionary
@@ -801,6 +1446,116 @@ def plot_comprehensive_calibration(encoder_results, label_names, n_bins=10, stra
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.show()
 
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.calibration import calibration_curve
+
+def plot_comprehensive_calibration2(linear_results, abmil_results, label_names, n_bins=10, strategy="uniform"):
+    """
+    Plots a multi-model calibration comparison grid.
+    Columns track individual targets; top row renders curves, bottom row shows distribution density.
+    """
+    sns.set_context("paper")
+    sns.set_style("whitegrid")
+    
+    n_labels = len(label_names)
+    fig, axes = plt.subplots(2, n_labels, figsize=(4.5 * n_labels, 8.5))
+    
+    # Consolidate results and purge the non-competitive dummy strategy
+    combined_results = [r for r in (linear_results + abmil_results) if r['model'] != 'Prevalence guesser']
+    
+    # Establish deterministic mapping for plot ordering and coloring
+    #models = ['Logistic Regression', 'SVM', 'Random Forest', 'MLP', 'ABMIL']
+    models = [ 'ABMIL']
+    models = [m for m in models if m in set(r['model'] for r in combined_results)]
+    
+    # Distinct publication-ready hex palette mapping
+    model_colors = {
+        'Logistic Regression': '#1f77b4',
+        'SVM': '#ff7f0e',
+        'Random Forest': '#2ca02c',
+        'MLP': '#9467bd',
+        'ABMIL': '#d62728'
+    }
+    
+    legend_handles = {}
+
+    for class_idx, label_name in enumerate(label_names):
+        ax_curve = axes[0, class_idx] if n_labels > 1 else axes[0]
+        ax_hist = axes[1, class_idx] if n_labels > 1 else axes[1]
+        
+        # Diagonal target line
+        ax_curve.plot([0, 1], [0, 1], linestyle='--', color='#7f7f7f', alpha=0.8, label='Perfect Calibration')
+        
+        for model_name in models:
+            model_trials = [r for r in combined_results if r['model'] == model_name]
+            if not model_trials:
+                continue
+                
+            trial_prob_true = []
+            common_bins = np.linspace(0, 1, n_bins)
+            bin_centers = (common_bins[:-1] + common_bins[1:]) / 2
+            all_pred_probas = []
+            
+            for trial in model_trials:
+                y_true = trial['oof_y_true'][:, class_idx]
+                y_prob = trial['oof_y_pred_proba'][:, class_idx]
+                all_pred_probas.extend(y_prob)
+                
+                # Extract curve coords using OOF blocks
+                p_true, p_pred = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy=strategy)
+                
+                # Resample cleanly onto consistent bin alignment coordinates
+                interp_true = np.interp(bin_centers, p_pred, p_true, left=np.nan, right=np.nan)
+                trial_prob_true.append(interp_true)
+            
+            # Aggregate trial performance vectors safely ignoring unreached prediction bins
+            mean_prob_true = np.nanmean(trial_prob_true, axis=0)
+            current_color = model_colors.get(model_name, '#333333')
+            
+            # --- Draw Reliability Curves ---
+            valid_mask = ~np.isnan(mean_prob_true)
+            line, = ax_curve.plot(
+                bin_centers[valid_mask], mean_prob_true[valid_mask], 
+                marker='o', markersize=4, linewidth=2, 
+                color=current_color, alpha=0.85
+            )
+            
+            if model_name not in legend_handles:
+                legend_handles[model_name] = line
+            
+            # --- Draw Density Histograms ---
+            ax_hist.hist(
+                all_pred_probas, bins=common_bins, histtype='step', 
+                linewidth=1.5, color=current_color, alpha=0.8
+            )
+        
+        # Subplot Layout and Design Polish
+        ax_curve.set_title(f"Calibration: {label_name}", fontsize=12, fontweight='bold', pad=10)
+        ax_curve.set_xlabel("Mean Predicted Probability", fontsize=12)
+        ax_curve.set_ylabel("Fraction of Positives", fontsize=12)
+        ax_curve.set_xlim(0, 1)
+        ax_curve.set_ylim(0, 1)
+        ax_curve.tick_params(axis='y', labelsize=14)
+        ax_hist.tick_params(axis='x', labelsize=14)
+        
+        ax_hist.set_title(f"Distribution: {label_name}", fontsize=12, fontweight='bold', pad=10)
+        ax_hist.set_xlabel("Predicted Probability", fontsize=12)
+        ax_hist.set_ylabel("Log Sample Density", fontsize=12)
+        ax_hist.set_xlim(0, 1)
+        ax_hist.set_yscale('log')
+        ax_hist.tick_params(axis='y', labelsize=14)
+        ax_hist.tick_params(axis='x', labelsize=14)
+
+    # Centralize universal shared legend mapping
+    fig.legend(
+        legend_handles.values(), legend_handles.keys(), loc='lower center', 
+        ncol=len(legend_handles), bbox_to_anchor=(0.5, -0.05), 
+        fontsize=10, frameon=True
+    )
+    
+    plt.tight_layout(rect=[0, 0.02, 1, 1])
+    plt.show()
 
 def label_confusion(y_true,y_pred_proba,y_pred_binary=None, label_names=None, threshold=0.5) :
     """

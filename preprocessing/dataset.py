@@ -16,6 +16,7 @@ import soundfile as sf
 import torchaudio
 import torchaudio.transforms as AT
 import torchaudio.functional as AF
+from scipy.signal import butter, sosfilt
 
 class BatAudioPipeline(torch.nn.Module):
     def __init__(
@@ -35,12 +36,14 @@ class BatAudioPipeline(torch.nn.Module):
         self.win_samples = window_sec * target_sr
         self.hop_samples = int(self.win_samples * (1.0 - overlap))
         self.filter_echo = filter_echo
+        self.orig_sr = None
 
-    def load_and_expand(self, file_path : str) -> torch.Tensor:
+    def load(self, file_path : str) -> torch.Tensor:
         """Loads audio using soundfile and applies 10x time expansion logic."""
         try:
             # Load using soundfile
             data, orig_sr = sf.read(file_path)
+            self.orig_sr = orig_sr
 
             # Convert to torch tensor [channels, time]
             # soundfile returns [time, channels] for stereo, so we transpose
@@ -54,72 +57,50 @@ class BatAudioPipeline(torch.nn.Module):
             if audio.shape[0] > 1:
                 audio = torch.mean(audio, dim=0, keepdim=True)
 
-            # Time Expansion logic
-            virtual_sr = orig_sr // self.expansion_factor
-
-            # Resample to target sample rate
-            if virtual_sr != self.target_sr:
-                audio = AF.resample(audio, orig_freq=virtual_sr, new_freq=self.target_sr)
-
             return audio
 
         except Exception as e:
             print(f"\n[Warning] Skipping {file_path}: {e}")
             # Return 1 second of silence as a fallback to prevent NoneType errors
             return torch.zeros((1, self.target_sr))
+    
+    def apply_time_expansion(self,audio: torch.Tensor) -> torch.Tensor:
+        # Time Expansion logic
+        virtual_sr = self.orig_sr // self.expansion_factor
+        # Resample to target sample rate
+        if virtual_sr != self.target_sr:
+            audio = AF.resample(audio, orig_freq=virtual_sr, new_freq=self.target_sr)
+        return audio
 
     def apply_bandpass(self, audio : torch.Tensor) -> torch.Tensor:
         """
-        Filters frequencies bats don't emit, taking into account time expansion.
-        The high-cut is already handled by the resampling Nyquist limit.
-        Eventually cuts out echolocation frequency band
+        Applies a high-order Butterworth filter using SciPy for a 
+        sharp cutoff before converting to PyTorch. Filters out low noise
+        and 
         """
+        # 1. Ensure orig_sr is an integer
+        fs = float(self.orig_sr)
+        # Convert torch tensor back to numpy temporarily for SciPy
+        audio_np = audio.cpu().numpy()
+
+        # 1.  8th-order Highpass at 15 kHz (48 dB/octave roll-off)
+        sos_hp = butter(N=8, Wn=15000, btype='highpass', fs=fs, output='sos')
+        audio_np = sosfilt(sos_hp, audio_np)
+
+        # 2. Optional:  Bandreject for Echolocation Echoes
         if self.filter_echo:
-            fmin = 40000/self.expansion_factor
-            fmax = 75000/self.expansion_factor
-            fcenter = np.sqrt(fmin * fmax)
-            Q = fcenter / (fmax - fmin)
-            audio = AF.bandreject_biquad(audio, sample_rate=self.target_sr, central_freq=fcenter, Q=Q)
-        # Highpass biquad filter at 15/time_expansion_factor kHz (Expanded domain)
-        return AF.highpass_biquad(audio, sample_rate=self.target_sr, cutoff_freq=15000/self.expansion_factor)
+            fmin, fmax = 40000, 75000
+            nyquist = fs / 2
+            if fmin >= nyquist:
+                pass 
+            else:
+                # Clamp fmax to just below the Nyquist limit
+                fmax = min(fmax, nyquist - 1) 
 
-    def generate_colored_noise(self, num_samples : int, exponent=1.0) -> torch.Tensor:
-        """0.0=White, 1.0=Pink (Rain), 2.0=Brown (Roar)"""
-        white_noise_fft = torch.fft.rfft(torch.randn(num_samples))
-        frequencies = torch.fft.rfftfreq(num_samples)
-        # Apply power law 1/f^beta
-        scaler = 1.0 / (frequencies** (exponent / 2.0) + 1e-10)
-        noise = torch.fft.irfft(white_noise_fft * scaler, n=num_samples)
-        return (noise / (noise.std() + 1e-10)).unsqueeze(0)
-    
-    def add_noise_snr(self, audio : torch.Tensor, noise_audio : torch.Tensor, snr_db : float) -> torch.Tensor:
-        """Mixes background noise at a specific Signal-to-Noise Ratio."""
-        # Ensure noise is the same length as the audio
-        if noise_audio.shape[1] < audio.shape[1]:
-            # Repeat noise if it's too short
-            repeats = math.ceil(audio.shape[1] / noise_audio.shape[1])
-            noise_audio = noise_audio.repeat(1, repeats)
-        
-        # Trim noise to exact audio length
-        noise_audio = noise_audio[:, :audio.shape[1]]
-        
-        # Calculate powers
-        audio_power = audio.norm(p=2)
-        noise_power = noise_audio.norm(p=2)
-        
-        # Avoid division by zero
-        if noise_power == 0:
-            return audio
-            
-        # Calculate required noise scalar to match target SNR
-        # SNR = 20 * log10(audio_power / target_noise_power)
-        target_noise_power = audio_power / (10 ** (snr_db / 20.0))
-        noise_scalar = target_noise_power / noise_power
-        
-        # Mix
-        mixed_audio = audio + (noise_audio * noise_scalar)
-        return mixed_audio
+                sos_br = butter(N=8, Wn=[fmin, fmax], btype='bandstop', fs=fs, output='sos')
+                audio_np = sosfilt(sos_br, audio_np)
 
+        return torch.from_numpy(audio_np).float()
 
     def window_audio(self, audio : torch.Tensor) -> torch.Tensor:
         """Cuts the 1D audio tensor into overlapping windows."""
@@ -134,42 +115,33 @@ class BatAudioPipeline(torch.nn.Module):
         windows = windows.squeeze(0)
         return windows
     
-    def time_shift(self, audio : torch.Tensor,shift_ratio = 0.25) -> torch.Tensor:
+    def time_shift(self, audio: torch.Tensor, shift_ratio=0.5) -> torch.Tensor:
         max_shift = int(shift_ratio * self.win_samples)
-        shift = random.randint(-max_shift, max_shift)
-        if shift != 0:
-            # Construct clean padding to prevent wrap-around artifacts
-            pad_len = abs(shift)
-            # Create silence padding matching the device of your audio tensors
-            if audio.ndim == 2:
-                # Match the number of channels from the original audio
-                num_channels = audio.shape[0]
-                padding = torch.zeros(num_channels, pad_len, dtype=audio.dtype, device=audio.device)
-            else:
-                # Fallback for 1D audio
-                padding = torch.zeros(pad_len, dtype=audio.dtype, device=audio.device)
-            
-            if shift > 0:
-                # Shift right: Prepend silence
-                shifted_audio = torch.cat([padding, audio], dim=-1)
-            else:
-                # Shift left: Append silence
-                shifted_audio = torch.cat([audio, padding], dim=-1)
-        return shifted_audio
+        shift = random.randint(0, max_shift)
+    
+        if shift > 0:
+            # Deletes the first 'shift' samples along the last axis
+            # and returns the rest of the window
+            return audio[..., shift:]
+        
+        return audio
 
     def forward(self, file_path : str,timeshift : bool = False) -> torch.Tensor:
 
         # 0. Load & Time Expand
-        audio = self.load_and_expand(file_path)
+        audio = self.load(file_path)
         
         # 1. Bandpass Filter
         audio = self.apply_bandpass(audio)
 
-        # 2. Data augmentation
+        #2. Time expand
+        audio = self.apply_time_expansion(audio)
+
+        # 3. Data augmentation
         if timeshift :
             audio = self.time_shift(audio)
 
-        # 3. Cut into Windows
+        # 4. Cut into Windows
         windows = self.window_audio(audio)
         
         return windows
@@ -196,7 +168,7 @@ class AugmentationPipeline:
         ir_per_label = max_count / (counts + 1e-9)
         return ir_per_label
         
-    def iterative_oversample(self, X, y, target_percentage=0.15,random_state = 42):
+    def iterative_oversample(self, X, y, target_percentage=0.2,random_state = 42):
         """
         Randomly duplicates samples containing minority labels 
         until the distribution balances out.
